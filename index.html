@@ -1,0 +1,1211 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Previsualizador de grilla — BURGUES</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+<style>
+  :root {
+    --admin-bg: #fafafa;
+    --admin-panel: #ffffff;
+    --admin-fg: #16161a;
+    --admin-muted: #6b7280;
+    --admin-border: #e3e3e6;
+    --admin-accent: #16161a;
+    --admin-accent-fg: #ffffff;
+    --admin-danger: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --admin-bg: #121214;
+      --admin-panel: #1b1b1e;
+      --admin-fg: #f2f2f3;
+      --admin-muted: #9a9aa3;
+      --admin-border: #2e2e33;
+      --admin-accent: #f2f2f3;
+      --admin-accent-fg: #16161a;
+      --admin-danger: #ff6b61;
+    }
+  }
+  :root[data-theme="dark"] {
+    --admin-bg: #121214;
+    --admin-panel: #1b1b1e;
+    --admin-fg: #f2f2f3;
+    --admin-muted: #9a9aa3;
+    --admin-border: #2e2e33;
+    --admin-accent: #f2f2f3;
+    --admin-accent-fg: #16161a;
+    --admin-danger: #ff6b61;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--admin-bg);
+    color: var(--admin-fg);
+    font-family: system-ui, -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  }
+  input, select, textarea, button { font-family: inherit; }
+  ::-webkit-scrollbar { height: 10px; width: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--admin-border); border-radius: 0; }
+
+  /* The storefront preview is intentionally always light — it is a fixed
+     mock of the real site chrome, not part of the admin theme. */
+  .storefront { background: #ffffff; color: #111111; }
+
+  .plp-card { position: relative; background: #ffffff; }
+  .plp-card.is-conflict { outline: 1px solid #d21f1f; outline-offset: -1px; }
+  .plp-card[draggable="true"] { cursor: grab; }
+  .plp-card.is-dragging { opacity: 0.4; }
+  .plp-card.is-drop-target { outline: 2px dashed #111111; outline-offset: -2px; }
+
+  .admin-input {
+    background: var(--admin-panel);
+    color: var(--admin-fg);
+    border: 1px solid var(--admin-border);
+  }
+  .admin-input::placeholder { color: var(--admin-muted); }
+  .admin-btn {
+    background: var(--admin-accent);
+    color: var(--admin-accent-fg);
+    border: 1px solid var(--admin-accent);
+  }
+  .admin-btn-ghost {
+    background: transparent;
+    color: var(--admin-fg);
+    border: 1px solid var(--admin-border);
+  }
+  .admin-btn:disabled, .admin-btn-ghost:disabled { opacity: 0.45; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+/* ============================== Utilidades ============================== */
+
+const STORAGE_KEY = "burgues-plp-preview-v1";
+
+function loadPersisted() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") return parsed;
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+const PERSISTED = loadPersisted();
+
+function savePersisted(state) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch (e) {
+    /* localStorage puede fallar (cuota, modo privado); no es crítico */
+  }
+}
+
+let _uidCounter = 0;
+function uid() {
+  _uidCounter += 1;
+  return "p_" + Date.now().toString(36) + "_" + _uidCounter.toString(36) + "_" + Math.random().toString(36).slice(2, 7);
+}
+
+function stripAccents(str) {
+  return String(str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+function inferCategoria(name) {
+  const norm = stripAccents(name).toUpperCase().trim();
+  if (!norm) return "OTROS";
+  if (norm.startsWith("TRAJE DE BANO")) return "TRAJE DE BAÑO";
+  const first = norm.split(/\s+/)[0];
+  return first || "OTROS";
+}
+
+function getBaseArticle(name) {
+  const norm = stripAccents(name).toUpperCase().trim();
+  if (!norm) return "";
+  const words = norm.split(/\s+/);
+  return words.slice(0, 2).join(" ");
+}
+
+function parseArsPrice(raw) {
+  if (raw == null) return null;
+  let s = String(raw).trim();
+  if (!s) return null;
+  s = s.replace(/\$/g, "").trim().replace(/\s+/g, "");
+  if (!s) return null;
+  const hasComma = s.includes(",");
+  const hasDot = s.includes(".");
+  if (hasComma && hasDot) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else if (hasComma) {
+    const parts = s.split(",");
+    if (parts.length === 2 && parts[1].length <= 2) {
+      s = parts[0] + "." + parts[1];
+    } else {
+      s = s.replace(/,/g, "");
+    }
+  } else if (hasDot) {
+    const parts = s.split(".");
+    if (parts.length > 1 && parts[parts.length - 1].length === 3) {
+      s = s.replace(/\./g, "");
+    }
+  }
+  const n = Number(s);
+  if (!isFinite(n) || isNaN(n)) return null;
+  return n;
+}
+
+function formatPriceARS(n) {
+  if (n == null || isNaN(n)) return "";
+  try {
+    return "$ " + Math.round(n).toLocaleString("es-AR");
+  } catch (e) {
+    return "$ " + Math.round(n);
+  }
+}
+
+function getDescuento(p) {
+  const price = Number(p.price) || 0;
+  if (price <= 0) return 0;
+  const special = p.special_price;
+  if (special == null || special === "" || isNaN(special)) return 0;
+  const sp = Number(special);
+  if (sp <= 0 || sp >= price) return 0;
+  return 1 - sp / price;
+}
+
+function csvEscape(v) {
+  const s = String(v == null ? "" : v);
+  if (/[",\n;]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+/* ------------------------------- CSV parsing ------------------------------ */
+
+function splitCsvLine(line, delim) {
+  const result = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; }
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === delim) {
+      result.push(cur);
+      cur = "";
+    } else {
+      cur += ch;
+    }
+  }
+  result.push(cur);
+  return result.map((s) => s.trim());
+}
+
+function detectDelimiter(headerLine) {
+  const commaCount = (headerLine.match(/,/g) || []).length;
+  const semiCount = (headerLine.match(/;/g) || []).length;
+  return semiCount > commaCount ? ";" : ",";
+}
+
+function parseCSV(text) {
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim() !== "");
+  if (!lines.length) return [];
+  const delim = detectDelimiter(lines[0]);
+  const header = splitCsvLine(lines[0], delim).map((h) => h.trim().toLowerCase());
+  const idx = {
+    sku: header.indexOf("sku"),
+    name: header.indexOf("name"),
+    price: header.indexOf("price"),
+    special_price: header.indexOf("special_price"),
+    url_img: header.indexOf("url_img"),
+  };
+  const mapped = Object.values(idx).every((v) => v !== -1);
+  const dataLines = mapped ? lines.slice(1) : lines; // si no matchea el header, asumimos que no hay header
+  return dataLines.map((line, i) => {
+    const cells = splitCsvLine(line, delim);
+    const pick = (key, fallback) => {
+      const v = mapped ? cells[idx[key]] : cells[fallback];
+      return v == null ? "" : String(v).trim();
+    };
+    const skuRaw = pick("sku", 0);
+    const nameRaw = pick("name", 1);
+    const priceRaw = pick("price", 2);
+    const specialRaw = pick("special_price", 3);
+    const urlRaw = pick("url_img", 4);
+
+    const rowErrors = [];
+    if (!skuRaw) rowErrors.push("SKU vacío");
+    const price = parseArsPrice(priceRaw);
+    if (priceRaw && price === null) rowErrors.push('precio no numérico ("' + priceRaw + '")');
+    let special = null;
+    if (specialRaw) {
+      special = parseArsPrice(specialRaw);
+      if (special === null) rowErrors.push('precio promo no numérico ("' + specialRaw + '")');
+    }
+    const looksLikeUrl = /^https?:\/\/\S+/i.test(urlRaw);
+    if (!looksLikeUrl) rowErrors.push("imagen sin URL válida");
+
+    return {
+      sku: skuRaw,
+      name: nameRaw,
+      price: price == null ? 0 : price,
+      special_price: special,
+      url_img: urlRaw,
+      rowErrors,
+      rowNumber: i + (mapped ? 2 : 1),
+    };
+  });
+}
+
+function makeProduct(raw, isExample) {
+  const name = raw.name || "";
+  return {
+    id: uid(),
+    sku: raw.sku || "",
+    name,
+    price: raw.price || 0,
+    special_price: raw.special_price == null ? null : raw.special_price,
+    url_img: raw.url_img || "",
+    categoria: inferCategoria(name),
+    categoriaManual: false,
+    baseArticle: getBaseArticle(name),
+    isExample: !!isExample,
+  };
+}
+
+function seedExamples() {
+  const rows = [
+    { sku: "TOL-NEG-42", name: "CAMPERA TOLEDO NEGRA", price: 189900, special_price: 129900, url_img: "" },
+    { sku: "TOL-AZU-42", name: "CAMPERA TOLEDO AZUL", price: 189900, special_price: 149900, url_img: "" },
+    { sku: "SAF-BLA-40", name: "CAMISA SAFARI BLANCA", price: 89900, special_price: null, url_img: "" },
+    { sku: "BON-GRI-M", name: "REMERA BONN GRIS", price: 39900, special_price: 25900, url_img: "" },
+    { sku: "MOD-BEI-38", name: "PANTALON MODENA BEIGE", price: 99900, special_price: 89900, url_img: "" },
+    { sku: "RAN-VER-L", name: "SWEATER RANIERI VERDE", price: 119900, special_price: null, url_img: "" },
+    { sku: "PIP-BLA-42", name: "SNEAKER PIPPEN BLANCO", price: 159900, special_price: 99900, url_img: "" },
+    { sku: "BAR-AZU-50", name: "SACO BARI AZUL", price: 249900, special_price: 199900, url_img: "" },
+  ];
+  return rows.map((r) => makeProduct(r, true));
+}
+
+/* --------------------------- Orden y restricciones ------------------------ */
+
+function sortByDescuento(products) {
+  return [...products].sort((a, b) => {
+    const da = getDescuento(a), db = getDescuento(b);
+    if (db !== da) return db - da;
+    return (Number(b.price) || 0) - (Number(a.price) || 0);
+  });
+}
+
+function computeViolations(arr, N) {
+  const conflictIndices = new Set();
+  let rowRepeats = 0, verticalRepeats = 0, closeArticles = 0;
+  const numRows = Math.ceil(arr.length / N);
+  for (let r = 0; r < numRows; r++) {
+    const rowStart = r * N, rowEnd = Math.min(arr.length, rowStart + N);
+    const seen = new Map();
+    for (let k = rowStart; k < rowEnd; k++) {
+      const cat = arr[k] && arr[k].categoria;
+      if (!cat) continue;
+      if (seen.has(cat)) {
+        rowRepeats++;
+        conflictIndices.add(k);
+        conflictIndices.add(seen.get(cat));
+      } else {
+        seen.set(cat, k);
+      }
+    }
+  }
+  for (let i = N; i < arr.length; i++) {
+    if (arr[i] && arr[i - N] && arr[i].categoria && arr[i].categoria === arr[i - N].categoria) {
+      verticalRepeats++;
+      conflictIndices.add(i);
+      conflictIndices.add(i - N);
+    }
+  }
+  for (let i = 0; i < arr.length; i++) {
+    const bi = arr[i] && arr[i].baseArticle;
+    if (!bi) continue;
+    for (let j = i + 1; j <= Math.min(i + 4, arr.length - 1); j++) {
+      if (arr[j] && arr[j].baseArticle === bi) {
+        closeArticles++;
+        conflictIndices.add(i);
+        conflictIndices.add(j);
+      }
+    }
+  }
+  return {
+    total: rowRepeats + verticalRepeats + closeArticles,
+    conflictIndices,
+    rowRepeats,
+    verticalRepeats,
+    closeArticles,
+  };
+}
+
+function buildOrder(products, N, adjacencyEnabled) {
+  const sorted = sortByDescuento(products);
+  if (!adjacencyEnabled || N <= 1 || sorted.length === 0) return sorted.map((p) => p.id);
+
+  const remaining = [...sorted];
+  const result = new Array(sorted.length).fill(null);
+
+  function violates(candidate, i) {
+    const rowStart = Math.floor(i / N) * N;
+    for (let k = rowStart; k < i; k++) {
+      if (result[k] && result[k].categoria === candidate.categoria) return true;
+    }
+    if (i >= N && result[i - N] && result[i - N].categoria === candidate.categoria) return true;
+    if (candidate.baseArticle) {
+      for (let k = Math.max(0, i - 4); k < i; k++) {
+        if (result[k] && result[k].baseArticle === candidate.baseArticle) return true;
+      }
+    }
+    return false;
+  }
+
+  for (let i = 0; i < sorted.length; i++) {
+    let chosenIdx = remaining.findIndex((c) => !violates(c, i));
+    if (chosenIdx === -1) chosenIdx = 0; // pool agotado: relajamos y tomamos el de mayor descuento disponible
+    result[i] = remaining[chosenIdx];
+    remaining.splice(chosenIdx, 1);
+  }
+
+  // pases de swap local (ventana ±30) para reparar violaciones remanentes
+  let arr = result.slice();
+  for (let pass = 0; pass < 3; pass++) {
+    const viol = computeViolations(arr, N);
+    if (viol.conflictIndices.size === 0) break;
+    const conflictList = Array.from(viol.conflictIndices).sort((a, b) => a - b);
+    let improved = false;
+    for (const p of conflictList) {
+      const currentViol = computeViolations(arr, N);
+      if (currentViol.total === 0) break;
+      const windowStart = Math.max(0, p - 30);
+      const windowEnd = Math.min(arr.length - 1, p + 30);
+      let bestJ = null, bestScore = currentViol.total;
+      for (let j = windowStart; j <= windowEnd; j++) {
+        if (j === p) continue;
+        const testArr = arr.slice();
+        const tmp = testArr[p]; testArr[p] = testArr[j]; testArr[j] = tmp;
+        const testViol = computeViolations(testArr, N);
+        if (testViol.total < bestScore) {
+          bestScore = testViol.total;
+          bestJ = j;
+        }
+      }
+      if (bestJ !== null) {
+        const tmp = arr[p]; arr[p] = arr[bestJ]; arr[bestJ] = tmp;
+        improved = true;
+      }
+    }
+    if (!improved) break;
+  }
+
+  return arr.map((p) => p.id);
+}
+
+function reorderList(list, startIndex, endIndex) {
+  const result = Array.from(list);
+  const [removed] = result.splice(startIndex, 1);
+  result.splice(endIndex, 0, removed);
+  return result;
+}
+
+/* ================================ UI: piezas =============================== */
+
+function Toast({ message, onDone }) {
+  useEffect(() => {
+    if (!message) return;
+    const t = setTimeout(onDone, 2600);
+    return () => clearTimeout(t);
+  }, [message]);
+  if (!message) return null;
+  return (
+    <div
+      className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[100] px-4 py-2 text-[13px] shadow-lg"
+      style={{ background: "var(--admin-accent)", color: "var(--admin-accent-fg)" }}
+    >
+      {message}
+    </div>
+  );
+}
+
+function ConfirmModal({ open, title, body, confirmLabel, onConfirm, onCancel }) {
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[90] flex items-center justify-center" style={{ background: "rgba(0,0,0,0.45)" }}>
+      <div className="w-full max-w-sm p-5" style={{ background: "var(--admin-panel)", color: "var(--admin-fg)", border: "1px solid var(--admin-border)" }}>
+        <div className="text-[15px] font-medium mb-2">{title}</div>
+        {body && <div className="text-[13px] mb-4" style={{ color: "var(--admin-muted)" }}>{body}</div>}
+        <div className="flex justify-end gap-2">
+          <button className="admin-btn-ghost px-3 py-1.5 text-[13px]" onClick={onCancel}>Cancelar</button>
+          <button className="px-3 py-1.5 text-[13px]" style={{ background: "var(--admin-danger)", color: "#fff" }} onClick={onConfirm}>
+            {confirmLabel || "Confirmar"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CopyFallbackModal({ open, title, text, onClose }) {
+  const taRef = useRef(null);
+  useEffect(() => {
+    if (open && taRef.current) {
+      taRef.current.focus();
+      taRef.current.select();
+    }
+  }, [open]);
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-[90] flex items-center justify-center p-6" style={{ background: "rgba(0,0,0,0.45)" }}>
+      <div className="w-full max-w-lg p-5" style={{ background: "var(--admin-panel)", color: "var(--admin-fg)", border: "1px solid var(--admin-border)" }}>
+        <div className="text-[15px] font-medium mb-2">{title}</div>
+        <div className="text-[12px] mb-2" style={{ color: "var(--admin-muted)" }}>
+          No se pudo copiar automáticamente. Seleccioná el texto y copialo manualmente (Ctrl/Cmd+C).
+        </div>
+        <textarea
+          ref={taRef}
+          readOnly
+          value={text}
+          className="admin-input w-full h-40 p-2 text-[12px]"
+          onFocus={(e) => e.target.select()}
+        />
+        <div className="flex justify-end mt-3">
+          <button className="admin-btn px-3 py-1.5 text-[13px]" onClick={onClose}>Cerrar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------- Tab bar --------------------------------- */
+
+function TabBar({ active, onChange, productCount }) {
+  const tabs = [
+    { id: "carga", label: "Carga" },
+    { id: "grilla", label: "Grilla" },
+  ];
+  return (
+    <div className="flex items-center justify-between px-4" style={{ borderBottom: "1px solid var(--admin-border)", background: "var(--admin-panel)" }}>
+      <div className="flex gap-1">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            onClick={() => onChange(t.id)}
+            className="px-4 py-3 text-[13px] tracking-wide"
+            style={{
+              color: active === t.id ? "var(--admin-fg)" : "var(--admin-muted)",
+              borderBottom: active === t.id ? "2px solid var(--admin-fg)" : "2px solid transparent",
+              fontWeight: active === t.id ? 600 : 400,
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      <div className="text-[12px]" style={{ color: "var(--admin-muted)" }}>{productCount} productos cargados</div>
+    </div>
+  );
+}
+
+/* ------------------------------ Carga: import ------------------------------ */
+
+function CsvImportPanel({ onImport }) {
+  const [text, setText] = useState("");
+  const fileRef = useRef(null);
+
+  function handleImportClick() {
+    if (!text.trim()) return;
+    onImport(text);
+  }
+
+  function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const content = String(ev.target.result || "");
+      setText(content);
+      onImport(content);
+    };
+    reader.readAsText(file, "UTF-8");
+    e.target.value = "";
+  }
+
+  return (
+    <section className="p-4" style={{ background: "var(--admin-panel)", border: "1px solid var(--admin-border)" }}>
+      <div className="text-[14px] font-medium mb-1">Cargar CSV</div>
+      <div className="text-[12px] mb-3" style={{ color: "var(--admin-muted)" }}>
+        Columnas: sku,name,price,special_price,url_img — separador coma o punto y coma, detectado automáticamente. Precios en formato argentino ("399.900", "$ 1.499.900").
+      </div>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Pegá acá el CSV..."
+        className="admin-input w-full h-32 p-2 text-[12px] font-mono mb-2"
+      />
+      <div className="flex flex-wrap items-center gap-2">
+        <button onClick={handleImportClick} className="admin-btn px-3 py-1.5 text-[13px]">Importar CSV pegado</button>
+        <button onClick={() => fileRef.current && fileRef.current.click()} className="admin-btn-ghost px-3 py-1.5 text-[13px]">
+          Subir archivo .csv
+        </button>
+        <input ref={fileRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleFile} />
+      </div>
+    </section>
+  );
+}
+
+function ImportSummary({ summary, errors, onDismiss }) {
+  if (!summary) return null;
+  return (
+    <div className="p-3 mt-3 text-[12px]" style={{ background: "var(--admin-panel)", border: "1px solid var(--admin-border)" }}>
+      <div className="flex items-center justify-between">
+        <div>
+          <strong>{summary.total}</strong> filas procesadas
+          {errors.length > 0 && <span> · <strong style={{ color: "var(--admin-danger)" }}>{errors.length}</strong> con errores</span>}
+        </div>
+        <button onClick={onDismiss} className="admin-btn-ghost px-2 py-1 text-[11px]">Cerrar</button>
+      </div>
+      {errors.length > 0 && (
+        <ul className="mt-2 max-h-40 overflow-y-auto list-disc pl-5 space-y-0.5">
+          {errors.map((e, i) => (
+            <li key={i} style={{ color: "var(--admin-danger)" }}>{e}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/* -------------------------------- Carga: tabla ------------------------------ */
+
+function ProductsTable({ products, categories, onUpdate, onDelete, onDuplicate }) {
+  return (
+    <div className="mt-4" style={{ overflowX: "auto", border: "1px solid var(--admin-border)" }}>
+      <datalist id="categorias-list">
+        {categories.map((c) => <option key={c} value={c} />)}
+      </datalist>
+      <table className="w-full text-[12px] border-collapse" style={{ minWidth: 900 }}>
+        <thead>
+          <tr style={{ background: "var(--admin-bg)" }}>
+            {["SKU", "Nombre", "Precio", "Precio promo", "Imagen (URL)", "Categoría", "Descuento", "Base artículo", ""].map((h) => (
+              <th key={h} className="text-left px-2 py-2 font-medium" style={{ borderBottom: "1px solid var(--admin-border)", color: "var(--admin-muted)" }}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {products.map((p) => (
+            <ProductRow key={p.id} p={p} onUpdate={onUpdate} onDelete={onDelete} onDuplicate={onDuplicate} />
+          ))}
+          {products.length === 0 && (
+            <tr><td colSpan={9} className="px-2 py-6 text-center" style={{ color: "var(--admin-muted)" }}>No hay productos cargados.</td></tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ProductRow({ p, onUpdate, onDelete, onDuplicate }) {
+  const descuento = getDescuento(p);
+  function field(key, value) {
+    onUpdate(p.id, { [key]: value });
+  }
+  function handleNameChange(value) {
+    const patch = { name: value };
+    if (!p.categoriaManual) {
+      patch.categoria = inferCategoria(value);
+    }
+    patch.baseArticle = getBaseArticle(value);
+    onUpdate(p.id, patch);
+  }
+  const imgOk = /^https?:\/\/\S+/i.test(p.url_img || "");
+  return (
+    <tr style={{ borderBottom: "1px solid var(--admin-border)" }}>
+      <td className="px-2 py-1">
+        <input className="admin-input px-1.5 py-1 w-28" value={p.sku} onChange={(e) => field("sku", e.target.value)} />
+      </td>
+      <td className="px-2 py-1">
+        <input className="admin-input px-1.5 py-1 w-56" value={p.name} onChange={(e) => handleNameChange(e.target.value)} />
+      </td>
+      <td className="px-2 py-1">
+        <input type="number" className="admin-input px-1.5 py-1 w-24" value={p.price} onChange={(e) => field("price", Number(e.target.value))} />
+      </td>
+      <td className="px-2 py-1">
+        <input
+          type="number"
+          className="admin-input px-1.5 py-1 w-24"
+          value={p.special_price == null ? "" : p.special_price}
+          placeholder="—"
+          onChange={(e) => field("special_price", e.target.value === "" ? null : Number(e.target.value))}
+        />
+      </td>
+      <td className="px-2 py-1">
+        <input
+          className="admin-input px-1.5 py-1 w-48"
+          style={!imgOk ? { color: "var(--admin-danger)" } : undefined}
+          value={p.url_img}
+          onChange={(e) => field("url_img", e.target.value)}
+          placeholder="sin URL"
+        />
+      </td>
+      <td className="px-2 py-1">
+        <input
+          list="categorias-list"
+          className="admin-input px-1.5 py-1 w-32"
+          value={p.categoria}
+          onChange={(e) => onUpdate(p.id, { categoria: e.target.value.toUpperCase(), categoriaManual: true })}
+        />
+      </td>
+      <td className="px-2 py-1 tabular-nums">{descuento > 0 ? Math.round(descuento * 100) + "%" : "—"}</td>
+      <td className="px-2 py-1" style={{ color: "var(--admin-muted)" }}>{p.baseArticle}</td>
+      <td className="px-2 py-1 whitespace-nowrap">
+        <button title="Duplicar" onClick={() => onDuplicate(p.id)} className="admin-btn-ghost px-2 py-1 mr-1">⧉</button>
+        <button title="Borrar" onClick={() => onDelete(p.id)} className="admin-btn-ghost px-2 py-1" style={{ color: "var(--admin-danger)" }}>✕</button>
+      </td>
+    </tr>
+  );
+}
+
+/* -------------------------------- Carga tab -------------------------------- */
+
+function CargaTab({ products, setProducts, categories }) {
+  const [summary, setSummary] = useState(null);
+  const [errors, setErrors] = useState([]);
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+
+  function handleImport(text) {
+    const rows = parseCSV(text);
+    const existingSkus = new Set(products.map((p) => p.sku).filter(Boolean));
+    const batchSkus = new Set();
+    const newProducts = [];
+    const allErrors = [];
+    rows.forEach((r) => {
+      const rowErrors = [...r.rowErrors];
+      if (r.sku) {
+        if (existingSkus.has(r.sku) || batchSkus.has(r.sku)) {
+          rowErrors.push("SKU duplicado (" + r.sku + ")");
+        } else {
+          batchSkus.add(r.sku);
+        }
+      }
+      if (rowErrors.length) allErrors.push("Fila " + r.rowNumber + ": " + rowErrors.join("; "));
+      newProducts.push(makeProduct(r, false));
+    });
+    setProducts((prev) => [...prev, ...newProducts]);
+    setSummary({ total: rows.length });
+    setErrors(allErrors);
+  }
+
+  function updateProduct(id, patch) {
+    setProducts((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  }
+  function deleteProduct(id) {
+    setProducts((prev) => prev.filter((p) => p.id !== id));
+  }
+  function duplicateProduct(id) {
+    setProducts((prev) => {
+      const idx = prev.findIndex((p) => p.id === id);
+      if (idx === -1) return prev;
+      const orig = prev[idx];
+      const copy = { ...orig, id: uid(), sku: orig.sku ? orig.sku + "-COPIA" : "", isExample: false };
+      const next = prev.slice();
+      next.splice(idx + 1, 0, copy);
+      return next;
+    });
+  }
+  function addBlankRow() {
+    setProducts((prev) => [...prev, makeProduct({ sku: "", name: "", price: 0, special_price: null, url_img: "" }, false)]);
+  }
+  function clearAll() {
+    setProducts([]);
+    setSummary(null);
+    setErrors([]);
+    setConfirmClearAll(false);
+  }
+  function clearExamples() {
+    setProducts((prev) => prev.filter((p) => !p.isExample));
+  }
+
+  const hasExamples = products.some((p) => p.isExample);
+
+  return (
+    <div className="p-4 max-w-[1400px] mx-auto">
+      <CsvImportPanel onImport={handleImport} />
+      <ImportSummary summary={summary} errors={errors} onDismiss={() => { setSummary(null); setErrors([]); }} />
+
+      <div className="flex flex-wrap items-center justify-between gap-2 mt-6 mb-2">
+        <div className="text-[14px] font-medium">Productos cargados ({products.length})</div>
+        <div className="flex gap-2">
+          {hasExamples && (
+            <button onClick={clearExamples} className="admin-btn-ghost px-3 py-1.5 text-[13px]">Limpiar ejemplos</button>
+          )}
+          <button onClick={addBlankRow} className="admin-btn-ghost px-3 py-1.5 text-[13px]">+ Agregar fila</button>
+          <button onClick={() => setConfirmClearAll(true)} className="admin-btn-ghost px-3 py-1.5 text-[13px]" style={{ color: "var(--admin-danger)" }}>
+            Vaciar todo
+          </button>
+        </div>
+      </div>
+
+      <ProductsTable
+        products={products}
+        categories={categories}
+        onUpdate={updateProduct}
+        onDelete={deleteProduct}
+        onDuplicate={duplicateProduct}
+      />
+
+      <ConfirmModal
+        open={confirmClearAll}
+        title="¿Vaciar todos los productos?"
+        body="Esta acción borra toda la carga actual. No se puede deshacer."
+        confirmLabel="Vaciar todo"
+        onConfirm={clearAll}
+        onCancel={() => setConfirmClearAll(false)}
+      />
+    </div>
+  );
+}
+
+/* -------------------------------- Grilla: UI -------------------------------- */
+
+function useIsMobile() {
+  const [isMobile, setIsMobile] = useState(() =>
+    typeof window !== "undefined" ? window.matchMedia("(max-width: 767px)").matches : false
+  );
+  useEffect(() => {
+    const mq = window.matchMedia("(max-width: 767px)");
+    const handler = (e) => setIsMobile(e.matches);
+    if (mq.addEventListener) mq.addEventListener("change", handler);
+    else mq.addListener(handler);
+    return () => {
+      if (mq.removeEventListener) mq.removeEventListener("change", handler);
+      else mq.removeListener(handler);
+    };
+  }, []);
+  return isMobile;
+}
+
+function ControlsBar({
+  perRow, setPerRow, adjacencyEnabled, setAdjacencyEnabled, showLabels, setShowLabels,
+  violations, onExportCsv, onCopySkus, onRecalc, downloadsAvailable, productCount,
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3" style={{ background: "var(--admin-panel)", borderBottom: "1px solid var(--admin-border)" }}>
+      <label className="flex items-center gap-2 text-[12px]">
+        Productos por fila
+        <select value={perRow} onChange={(e) => setPerRow(Number(e.target.value))} className="admin-input px-1.5 py-1">
+          {[2, 3, 4, 5].map((n) => <option key={n} value={n}>{n}</option>)}
+        </select>
+      </label>
+
+      <label className="flex items-center gap-2 text-[12px]">
+        <input type="checkbox" checked={adjacencyEnabled} onChange={(e) => setAdjacencyEnabled(e.target.checked)} />
+        Aplicar reglas de adyacencia
+      </label>
+
+      <label className="flex items-center gap-2 text-[12px]">
+        <input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
+        Mostrar etiquetas de categoría
+      </label>
+
+      <button onClick={onRecalc} className="admin-btn-ghost px-3 py-1.5 text-[12px]">↻ Recalcular orden</button>
+
+      <div className="text-[12px]" style={{ color: "var(--admin-muted)" }}>
+        {violations.rowRepeats} categorías repetidas en fila · {violations.verticalRepeats} en vertical · {violations.closeArticles} artículos cercanos
+      </div>
+
+      <div className="flex-1" />
+
+      <div className="text-[12px]" style={{ color: "var(--admin-muted)" }}>{productCount} productos</div>
+      <button onClick={onCopySkus} className="admin-btn-ghost px-3 py-1.5 text-[12px]">Copiar SKUs en orden</button>
+      <button onClick={onExportCsv} className="admin-btn px-3 py-1.5 text-[12px]">Exportar orden</button>
+    </div>
+  );
+}
+
+function StoreHeader({ categoryTitle, setCategoryTitle }) {
+  const filters = ["Corte", "Tipo", "Estilo", "Color", "Talle"];
+  return (
+    <div className="storefront">
+      <div className="text-center text-white" style={{ background: "#111111", fontSize: 10, letterSpacing: "0.08em", padding: "6px 0", textTransform: "uppercase" }}>
+        Envíos a todo el país · 3 y 6 cuotas sin interés
+      </div>
+      <div className="px-4 pt-5 pb-3">
+        <input
+          value={categoryTitle}
+          onChange={(e) => setCategoryTitle(e.target.value)}
+          placeholder="NOMBRE DE CATEGORÍA"
+          className="block w-full font-normal uppercase"
+          style={{ border: "none", outline: "none", fontSize: 28, letterSpacing: "0.01em", color: "#111111", background: "transparent" }}
+        />
+      </div>
+      <div className="flex items-center justify-between px-4 pb-3" style={{ borderBottom: "1px solid #111111" }}>
+        <div className="flex gap-5">
+          {filters.map((f) => (
+            <span key={f} className="uppercase" style={{ fontSize: 10, letterSpacing: "0.06em", color: "#111111" }}>{f} ▾</span>
+          ))}
+        </div>
+        <span className="uppercase" style={{ fontSize: 10, letterSpacing: "0.06em", color: "#111111" }}>Ordenar por ▾</span>
+      </div>
+    </div>
+  );
+}
+
+function ProductImage({ url }) {
+  const [failed, setFailed] = useState(false);
+  const showPlaceholder = !url || failed;
+  return (
+    <div style={{ width: "100%", aspectRatio: "3 / 4", background: "#e2e2e2", overflow: "hidden" }}>
+      {!showPlaceholder && (
+        <img
+          src={url}
+          draggable={false}
+          onError={() => setFailed(true)}
+          style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ProductCard({ product, colorCount, showLabels, isConflict, index, dnd }) {
+  const descuento = getDescuento(product);
+  const vigente = descuento > 0 ? product.special_price : product.price;
+  const sinImpuestos = Math.round((Number(vigente) || 0) / 1.21);
+  const dotColor = useMemo(() => {
+    let h = 0;
+    const s = product.sku || product.id;
+    for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) % 360;
+    return "hsl(" + h + ", 45%, 45%)";
+  }, [product.sku, product.id]);
+
+  return (
+    <div
+      className={"plp-card" + (isConflict ? " is-conflict" : "") + (dnd.draggingIndex === index ? " is-dragging" : "") + (dnd.dragOverIndex === index ? " is-drop-target" : "")}
+      draggable
+      onDragStart={() => dnd.onDragStart(index)}
+      onDragOver={(e) => { e.preventDefault(); dnd.onDragOver(index); }}
+      onDrop={(e) => { e.preventDefault(); dnd.onDrop(index); }}
+      onDragEnd={dnd.onDragEnd}
+    >
+      <div style={{ position: "relative" }}>
+        <ProductImage url={product.url_img} />
+        {descuento > 0 && (
+          <div style={{ position: "absolute", top: 0, left: 0, background: "#111111", color: "#fff", fontSize: 10, padding: "3px 6px" }}>
+            -{Math.round(descuento * 100)}%
+          </div>
+        )}
+        {showLabels && (
+          <div style={{ position: "absolute", top: 0, right: 0, background: "rgba(255,255,255,0.9)", color: "#111111", fontSize: 9, padding: "3px 6px", letterSpacing: "0.04em" }}>
+            {product.categoria}
+          </div>
+        )}
+      </div>
+      <div style={{ padding: 8, background: "#ffffff" }}>
+        <div className="flex items-center justify-between gap-2">
+          <div
+            className="uppercase truncate"
+            style={{ fontSize: 11, letterSpacing: "0.04em", fontWeight: 400, color: "#111111" }}
+            title={product.name}
+          >
+            {product.name || "(sin nombre)"}
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <span style={{ width: 7, height: 7, borderRadius: "50%", background: dotColor, display: "inline-block" }} />
+            {colorCount > 1 && <span style={{ fontSize: 9, color: "#8a8a8a" }}>+ {colorCount - 1} Colores</span>}
+          </div>
+        </div>
+        <div style={{ fontSize: 12, marginTop: 4, color: "#111111" }}>
+          {descuento > 0 ? (
+            <React.Fragment>
+              <span style={{ textDecoration: "line-through", color: "#9a9a9a", marginRight: 6 }}>{formatPriceARS(product.price)}</span>
+              <span>{formatPriceARS(product.special_price)}</span>
+            </React.Fragment>
+          ) : (
+            <span>{formatPriceARS(product.price)}</span>
+          )}
+        </div>
+        <div style={{ fontSize: 9, color: "#9a9a9a", marginTop: 2 }}>
+          Precio sin impuestos nacionales: {formatPriceARS(sinImpuestos)}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProductGrid({ orderedProducts, effectiveCols, colorCounts, showLabels, conflictIndices, onReorder }) {
+  const [draggingIndex, setDraggingIndex] = useState(null);
+  const [dragOverIndex, setDragOverIndex] = useState(null);
+
+  const dnd = {
+    draggingIndex,
+    dragOverIndex,
+    onDragStart: (i) => setDraggingIndex(i),
+    onDragOver: (i) => setDragOverIndex(i),
+    onDrop: (i) => {
+      if (draggingIndex !== null && draggingIndex !== i) onReorder(draggingIndex, i);
+      setDraggingIndex(null);
+      setDragOverIndex(null);
+    },
+    onDragEnd: () => { setDraggingIndex(null); setDragOverIndex(null); },
+  };
+
+  return (
+    <div
+      className="storefront"
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(" + effectiveCols + ", 1fr)",
+        columnGap: 0,
+        rowGap: "20px",
+        background: "#ffffff",
+      }}
+    >
+      {orderedProducts.map((p, i) => (
+        <ProductCard
+          key={p.id}
+          product={p}
+          index={i}
+          colorCount={colorCounts.get(p.baseArticle) || 1}
+          showLabels={showLabels}
+          isConflict={conflictIndices.has(i)}
+          dnd={dnd}
+        />
+      ))}
+      {orderedProducts.length === 0 && (
+        <div className="col-span-full py-16 text-center" style={{ color: "#8a8a8a", fontSize: 13 }}>
+          No hay productos para mostrar. Cargalos en la pestaña "Carga".
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* --------------------------------- Grilla tab -------------------------------- */
+
+function GrillaTab({
+  products, order, setOrder, perRow, setPerRow, adjacencyEnabled, setAdjacencyEnabled,
+  showLabels, setShowLabels, categoryTitle, setCategoryTitle, recalcOrder, downloadsApi, showToast,
+}) {
+  const isMobile = useIsMobile();
+  const effectiveCols = isMobile ? 2 : perRow;
+
+  const productsById = useMemo(() => {
+    const m = new Map();
+    products.forEach((p) => m.set(p.id, p));
+    return m;
+  }, [products]);
+
+  const orderedProducts = useMemo(
+    () => order.map((id) => productsById.get(id)).filter(Boolean),
+    [order, productsById]
+  );
+
+  const colorCounts = useMemo(() => {
+    const m = new Map();
+    products.forEach((p) => {
+      if (!p.baseArticle) return;
+      m.set(p.baseArticle, (m.get(p.baseArticle) || 0) + 1);
+    });
+    return m;
+  }, [products]);
+
+  const violations = useMemo(
+    () => computeViolations(orderedProducts, effectiveCols),
+    [orderedProducts, effectiveCols]
+  );
+
+  const [copyModal, setCopyModal] = useState(null);
+
+  function handleReorder(fromIndex, toIndex) {
+    const reorderedIds = reorderList(order, fromIndex, toIndex);
+    setOrder(reorderedIds);
+  }
+
+  async function handleCopySkus() {
+    const skus = orderedProducts.map((p) => p.sku).filter(Boolean).join(", ");
+    if (!skus) { showToast("No hay SKUs para copiar"); return; }
+    try {
+      await navigator.clipboard.writeText(skus);
+      showToast("SKUs copiados al portapapeles");
+    } catch (e) {
+      setCopyModal({ title: "SKUs en orden", text: skus });
+    }
+  }
+
+  async function handleExportCsv() {
+    const rows = [["posicion", "fila", "columna", "sku", "name", "categoria", "price", "special_price", "descuento"]];
+    orderedProducts.forEach((p, i) => {
+      const fila = Math.floor(i / effectiveCols) + 1;
+      const columna = (i % effectiveCols) + 1;
+      rows.push([i + 1, fila, columna, p.sku, p.name, p.categoria, p.price, p.special_price == null ? "" : p.special_price, getDescuento(p).toFixed(4)]);
+    });
+    const csvContent = rows.map((r) => r.map(csvEscape).join(",")).join("\n");
+    if (downloadsApi) {
+      try {
+        await downloadsApi.save({ filename: "orden-grilla.csv", data: csvContent });
+        showToast("CSV descargado");
+      } catch (err) {
+        if (err && err.code === "declined") {
+          /* el usuario canceló, no hace falta avisar */
+        } else {
+          setCopyModal({ title: "orden-grilla.csv", text: csvContent });
+        }
+      }
+    } else {
+      setCopyModal({ title: "orden-grilla.csv", text: csvContent });
+    }
+  }
+
+  return (
+    <div className="w-full">
+      <ControlsBar
+        perRow={perRow}
+        setPerRow={setPerRow}
+        adjacencyEnabled={adjacencyEnabled}
+        setAdjacencyEnabled={setAdjacencyEnabled}
+        showLabels={showLabels}
+        setShowLabels={setShowLabels}
+        violations={violations}
+        onExportCsv={handleExportCsv}
+        onCopySkus={handleCopySkus}
+        onRecalc={recalcOrder}
+        downloadsAvailable={!!downloadsApi}
+        productCount={orderedProducts.length}
+      />
+      <StoreHeader categoryTitle={categoryTitle} setCategoryTitle={setCategoryTitle} />
+      <ProductGrid
+        orderedProducts={orderedProducts}
+        effectiveCols={effectiveCols}
+        colorCounts={colorCounts}
+        showLabels={showLabels}
+        conflictIndices={violations.conflictIndices}
+        onReorder={handleReorder}
+      />
+      <CopyFallbackModal
+        open={!!copyModal}
+        title={copyModal ? copyModal.title : ""}
+        text={copyModal ? copyModal.text : ""}
+        onClose={() => setCopyModal(null)}
+      />
+    </div>
+  );
+}
+
+/* ==================================== App ==================================== */
+
+function App() {
+  const [activeTab, setActiveTab] = useState("carga");
+
+  const [products, setProducts] = useState(() => {
+    if (PERSISTED && Array.isArray(PERSISTED.products)) return PERSISTED.products;
+    return seedExamples();
+  });
+  const [order, setOrder] = useState(() => (PERSISTED && Array.isArray(PERSISTED.order) ? PERSISTED.order : []));
+  const settings = (PERSISTED && PERSISTED.settings) || {};
+  const [perRow, setPerRow] = useState(settings.perRow || 4);
+  const [adjacencyEnabled, setAdjacencyEnabled] = useState(settings.adjacencyEnabled != null ? settings.adjacencyEnabled : true);
+  const [showLabels, setShowLabels] = useState(settings.showLabels != null ? settings.showLabels : true);
+  const [categoryTitle, setCategoryTitle] = useState(settings.categoryTitle || "REMERAS");
+
+  const [toast, setToast] = useState("");
+  const showToast = useCallback((msg) => setToast(msg), []);
+
+  const [downloadsApi, setDownloadsApi] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    if (window.claude && typeof window.claude.use === "function") {
+      window.claude.use("downloads").then((api) => { if (!cancelled) setDownloadsApi(api); }).catch(() => {});
+    }
+    return () => { cancelled = true; };
+  }, []);
+
+  const lastKeyRef = useRef(null);
+  useEffect(() => {
+    const key = JSON.stringify([products.map((p) => p.id), perRow, adjacencyEnabled]);
+    if (lastKeyRef.current === null) {
+      lastKeyRef.current = key;
+      const idsMatch = order.length === products.length && products.every((p) => order.includes(p.id));
+      if (idsMatch) return;
+    } else if (lastKeyRef.current === key) {
+      return;
+    } else {
+      lastKeyRef.current = key;
+    }
+    setOrder(buildOrder(products, perRow, adjacencyEnabled));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [products, perRow, adjacencyEnabled]);
+
+  function recalcOrder() {
+    lastKeyRef.current = JSON.stringify([products.map((p) => p.id), perRow, adjacencyEnabled]);
+    setOrder(buildOrder(products, perRow, adjacencyEnabled));
+  }
+
+  useEffect(() => {
+    savePersisted({
+      products,
+      order,
+      settings: { perRow, adjacencyEnabled, showLabels, categoryTitle },
+    });
+  }, [products, order, perRow, adjacencyEnabled, showLabels, categoryTitle]);
+
+  const categories = useMemo(() => {
+    const set = new Set(products.map((p) => p.categoria).filter(Boolean));
+    set.add("OTROS");
+    return Array.from(set).sort();
+  }, [products]);
+
+  return (
+    <div style={{ minHeight: "100vh" }}>
+      <TabBar active={activeTab} onChange={setActiveTab} productCount={products.length} />
+      {activeTab === "carga" ? (
+        <CargaTab products={products} setProducts={setProducts} categories={categories} />
+      ) : (
+        <GrillaTab
+          products={products}
+          order={order}
+          setOrder={setOrder}
+          perRow={perRow}
+          setPerRow={setPerRow}
+          adjacencyEnabled={adjacencyEnabled}
+          setAdjacencyEnabled={setAdjacencyEnabled}
+          showLabels={showLabels}
+          setShowLabels={setShowLabels}
+          categoryTitle={categoryTitle}
+          setCategoryTitle={setCategoryTitle}
+          recalcOrder={recalcOrder}
+          downloadsApi={downloadsApi}
+          showToast={showToast}
+        />
+      )}
+      <Toast message={toast} onDone={() => setToast("")} />
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
