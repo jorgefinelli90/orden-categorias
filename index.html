@@ -92,6 +92,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 /* ============================== Utilidades ============================== */
 
 const STORAGE_KEY = "burgues-plp-preview-v1";
+const STORAGE_KEY_BASE = "burgues-plp-base-v1";
 
 function loadPersisted() {
   try {
@@ -114,6 +115,27 @@ function savePersisted(state) {
   }
 }
 
+function loadPersistedBase() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_BASE);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && Array.isArray(parsed.rows)) return parsed;
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+const PERSISTED_BASE = loadPersistedBase();
+
+function savePersistedBase(state) {
+  try {
+    localStorage.setItem(STORAGE_KEY_BASE, JSON.stringify(state));
+  } catch (e) {
+    /* localStorage puede fallar (cuota, modo privado); no es crítico */
+  }
+}
+
 let _uidCounter = 0;
 function uid() {
   _uidCounter += 1;
@@ -124,19 +146,22 @@ function stripAccents(str) {
   return String(str || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 }
 
-function inferCategoria(name) {
-  const norm = stripAccents(name).toUpperCase().trim();
-  if (!norm) return "OTROS";
-  if (norm.startsWith("TRAJE DE BANO")) return "TRAJE DE BAÑO";
-  const first = norm.split(/\s+/)[0];
-  return first || "OTROS";
+function normalizeArticleKey(name) {
+  return stripAccents(name).toUpperCase().trim().replace(/\s+/g, " ");
 }
 
-function getBaseArticle(name) {
-  const norm = stripAccents(name).toUpperCase().trim();
-  if (!norm) return "";
-  const words = norm.split(/\s+/);
-  return words.slice(0, 2).join(" ");
+function parseTalles(raw) {
+  return String(raw || "")
+    .split(/[|,/]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function buildProductUrl(link) {
+  const clean = String(link || "").trim().replace(/^\/+/, "");
+  if (!clean) return "";
+  if (/^https?:\/\//i.test(clean)) return clean;
+  return "https://www.burgues.com/" + clean;
 }
 
 function parseArsPrice(raw) {
@@ -225,84 +250,129 @@ function detectDelimiter(headerLine) {
   return semiCount > commaCount ? ";" : ",";
 }
 
-function parseCSV(text) {
+/* --------------------------- Base de productos (catálogo) ------------------ */
+
+function parseBaseCsv(text) {
   const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n").filter((l) => l.trim() !== "");
-  if (!lines.length) return [];
+  if (!lines.length) return { rows: [], errors: ["El archivo está vacío."] };
   const delim = detectDelimiter(lines[0]);
   const header = splitCsvLine(lines[0], delim).map((h) => h.trim().toLowerCase());
+  const normHeader = header.map((h) => h.replace(/[\s_-]+/g, ""));
+  const findCol = (...names) => {
+    for (const n of names) {
+      const i = normHeader.indexOf(n.replace(/[\s_-]+/g, ""));
+      if (i !== -1) return i;
+    }
+    return -1;
+  };
   const idx = {
     sku: header.indexOf("sku"),
     name: header.indexOf("name"),
+    categoria: header.indexOf("categoria"),
     price: header.indexOf("price"),
     special_price: header.indexOf("special_price"),
-    url_img: header.indexOf("url_img"),
+    url_img: findCol("link_imagen", "url_img"),
+    link_producto: findCol("link_producto", "url_producto"),
+    talles: findCol("talles", "talles_disponibles", "talles-disponibles", "sizes"),
   };
-  const mapped = Object.values(idx).every((v) => v !== -1);
-  const dataLines = mapped ? lines.slice(1) : lines; // si no matchea el header, asumimos que no hay header
-  return dataLines.map((line, i) => {
-    const cells = splitCsvLine(line, delim);
-    const pick = (key, fallback) => {
-      const v = mapped ? cells[idx[key]] : cells[fallback];
-      return v == null ? "" : String(v).trim();
+  if (idx.sku === -1 || idx.name === -1 || idx.price === -1) {
+    return {
+      rows: [],
+      errors: [
+        'El archivo debe tener al menos las columnas "sku", "name" y "price" (encontradas: ' +
+          header.filter(Boolean).join(", ") +
+          ").",
+      ],
     };
-    const skuRaw = pick("sku", 0);
-    const nameRaw = pick("name", 1);
-    const priceRaw = pick("price", 2);
-    const specialRaw = pick("special_price", 3);
-    const urlRaw = pick("url_img", 4);
-
-    const rowErrors = [];
-    if (!skuRaw) rowErrors.push("SKU vacío");
+  }
+  const errors = [];
+  const rows = [];
+  const seen = new Set();
+  lines.slice(1).forEach((line, i) => {
+    const cells = splitCsvLine(line, delim);
+    const rowNumber = i + 2;
+    const get = (key) => (idx[key] != null && idx[key] !== -1 ? (cells[idx[key]] || "").trim() : "");
+    const sku = get("sku");
+    if (!sku) return;
+    const skuKey = sku.toUpperCase();
+    if (seen.has(skuKey)) {
+      errors.push("Fila " + rowNumber + ": SKU duplicado en la base (" + sku + ")");
+      return;
+    }
+    seen.add(skuKey);
+    const priceRaw = get("price");
     const price = parseArsPrice(priceRaw);
-    if (priceRaw && price === null) rowErrors.push('precio no numérico ("' + priceRaw + '")');
+    if (priceRaw && price === null) errors.push("Fila " + rowNumber + ': precio no numérico ("' + priceRaw + '")');
+    const specialRaw = get("special_price");
     let special = null;
     if (specialRaw) {
       special = parseArsPrice(specialRaw);
-      if (special === null) rowErrors.push('precio promo no numérico ("' + specialRaw + '")');
+      if (special === null) errors.push("Fila " + rowNumber + ': precio promo no numérico ("' + specialRaw + '")');
     }
-    const looksLikeUrl = /^https?:\/\/\S+/i.test(urlRaw);
-    if (!looksLikeUrl) rowErrors.push("imagen sin URL válida");
-
-    return {
-      sku: skuRaw,
-      name: nameRaw,
+    rows.push({
+      sku,
+      name: get("name"),
+      categoria: get("categoria") || "OTROS",
       price: price == null ? 0 : price,
       special_price: special,
-      url_img: urlRaw,
-      rowErrors,
-      rowNumber: i + (mapped ? 2 : 1),
-    };
+      url_img: get("url_img"),
+      link_producto: get("link_producto"),
+      talles: parseTalles(get("talles")),
+    });
   });
+  return { rows, errors };
 }
 
-function makeProduct(raw, isExample) {
-  const name = raw.name || "";
+function buildCatalogIndex(rows) {
+  const map = new Map();
+  (rows || []).forEach((r) => {
+    if (r && r.sku) map.set(r.sku.toUpperCase(), r);
+  });
+  return map;
+}
+
+function parseSkuList(text) {
+  return String(text || "")
+    .split(/[\s,;]+/)
+    .map((s) => s.trim())
+    .filter((s) => s && s.toLowerCase() !== "sku");
+}
+
+function makeProductFromCatalogRow(row) {
   return {
     id: uid(),
-    sku: raw.sku || "",
-    name,
-    price: raw.price || 0,
-    special_price: raw.special_price == null ? null : raw.special_price,
-    url_img: raw.url_img || "",
-    categoria: inferCategoria(name),
-    categoriaManual: false,
-    baseArticle: getBaseArticle(name),
-    isExample: !!isExample,
+    sku: row.sku,
+    name: row.name || "",
+    price: row.price || 0,
+    special_price: row.special_price == null ? null : row.special_price,
+    url_img: row.url_img || "",
+    categoria: row.categoria || "OTROS",
+    baseArticle: normalizeArticleKey(row.name),
+    productUrl: buildProductUrl(row.link_producto),
+    talles: Array.isArray(row.talles) ? row.talles : [],
   };
 }
 
-function seedExamples() {
-  const rows = [
-    { sku: "TOL-NEG-42", name: "CAMPERA TOLEDO NEGRA", price: 189900, special_price: 129900, url_img: "" },
-    { sku: "TOL-AZU-42", name: "CAMPERA TOLEDO AZUL", price: 189900, special_price: 149900, url_img: "" },
-    { sku: "SAF-BLA-40", name: "CAMISA SAFARI BLANCA", price: 89900, special_price: null, url_img: "" },
-    { sku: "BON-GRI-M", name: "REMERA BONN GRIS", price: 39900, special_price: 25900, url_img: "" },
-    { sku: "MOD-BEI-38", name: "PANTALON MODENA BEIGE", price: 99900, special_price: 89900, url_img: "" },
-    { sku: "RAN-VER-L", name: "SWEATER RANIERI VERDE", price: 119900, special_price: null, url_img: "" },
-    { sku: "PIP-BLA-42", name: "SNEAKER PIPPEN BLANCO", price: 159900, special_price: 99900, url_img: "" },
-    { sku: "BAR-AZU-50", name: "SACO BARI AZUL", price: 249900, special_price: 199900, url_img: "" },
-  ];
-  return rows.map((r) => makeProduct(r, true));
+function generateFromSkuList(tokens, catalogMap) {
+  const seen = new Set();
+  const products = [];
+  const missing = [];
+  const duplicates = [];
+  tokens.forEach((tok) => {
+    const key = tok.toUpperCase();
+    if (seen.has(key)) {
+      duplicates.push(tok);
+      return;
+    }
+    const row = catalogMap.get(key);
+    if (!row) {
+      missing.push(tok);
+      return;
+    }
+    seen.add(key);
+    products.push(makeProductFromCatalogRow(row));
+  });
+  return { products, order: products.map((p) => p.id), missing, duplicates };
 }
 
 /* --------------------------- Orden y restricciones ------------------------ */
@@ -528,15 +598,88 @@ function TabBar({ active, onChange, productCount }) {
   );
 }
 
-/* ------------------------------ Carga: import ------------------------------ */
+/* --------------------------- Carga: base de productos ----------------------- */
 
-function CsvImportPanel({ onImport }) {
+function formatDateTime(ts) {
+  if (!ts) return "";
+  try {
+    return new Date(ts).toLocaleString("es-AR");
+  } catch (e) {
+    return "";
+  }
+}
+
+function BaseCatalogPanel({ baseCatalog, onLoad }) {
   const [text, setText] = useState("");
   const fileRef = useRef(null);
 
-  function handleImportClick() {
+  function handleFile(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => onLoad(String(ev.target.result || ""), file.name);
+    reader.readAsText(file, "UTF-8");
+    e.target.value = "";
+  }
+
+  function handlePasteLoad() {
     if (!text.trim()) return;
-    onImport(text);
+    onLoad(text, "pegado a mano");
+    setText("");
+  }
+
+  const hasBase = !!(baseCatalog && baseCatalog.rows.length);
+
+  return (
+    <section className="p-4" style={{ background: "var(--admin-panel)", border: "1px solid var(--admin-border)" }}>
+      <div className="text-[14px] font-medium mb-1">1. Base de productos</div>
+      <div className="text-[12px] mb-3" style={{ color: "var(--admin-muted)" }}>
+        Cargá una vez el archivo <code>base.csv</code> (columnas: sku, name, categoria, price, special_price, link_imagen).
+        Queda guardado en este navegador; solo hace falta repetirlo cuando se actualice el catálogo.
+      </div>
+
+      {hasBase ? (
+        <div className="text-[12px] mb-3 px-3 py-2" style={{ background: "var(--admin-bg)", border: "1px solid var(--admin-border)" }}>
+          Base cargada: <strong>{baseCatalog.rows.length}</strong> SKUs
+          {baseCatalog.sourceName ? <span> · {baseCatalog.sourceName}</span> : null}
+          {baseCatalog.updatedAt ? <span> · {formatDateTime(baseCatalog.updatedAt)}</span> : null}
+        </div>
+      ) : (
+        <div className="text-[12px] mb-3 px-3 py-2" style={{ background: "var(--admin-bg)", border: "1px solid var(--admin-border)", color: "var(--admin-danger)" }}>
+          Todavía no hay ninguna base cargada.
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2 mb-2">
+        <button onClick={() => fileRef.current && fileRef.current.click()} className="admin-btn px-3 py-1.5 text-[13px]">
+          {hasBase ? "Reemplazar base.csv" : "Subir base.csv"}
+        </button>
+        <input ref={fileRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleFile} />
+      </div>
+
+      <details>
+        <summary className="text-[12px] cursor-pointer select-none" style={{ color: "var(--admin-muted)" }}>o pegar el contenido del CSV a mano</summary>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Pegá acá el contenido de base.csv..."
+          className="admin-input w-full h-28 p-2 text-[12px] font-mono mt-2 mb-2"
+        />
+        <button onClick={handlePasteLoad} className="admin-btn-ghost px-3 py-1.5 text-[13px]">Cargar CSV pegado</button>
+      </details>
+    </section>
+  );
+}
+
+/* ----------------------------- Carga: lista de SKUs -------------------------- */
+
+function SkuListPanel({ disabled, onGenerate }) {
+  const [text, setText] = useState("");
+  const fileRef = useRef(null);
+
+  function handleGenerateClick() {
+    if (!text.trim()) return;
+    onGenerate(text);
   }
 
   function handleFile(e) {
@@ -546,7 +689,7 @@ function CsvImportPanel({ onImport }) {
     reader.onload = (ev) => {
       const content = String(ev.target.result || "");
       setText(content);
-      onImport(content);
+      onGenerate(content);
     };
     reader.readAsText(file, "UTF-8");
     e.target.value = "";
@@ -554,71 +697,83 @@ function CsvImportPanel({ onImport }) {
 
   return (
     <section className="p-4" style={{ background: "var(--admin-panel)", border: "1px solid var(--admin-border)" }}>
-      <div className="text-[14px] font-medium mb-1">Cargar CSV</div>
+      <div className="text-[14px] font-medium mb-1">2. Listado de SKUs a mostrar</div>
       <div className="text-[12px] mb-3" style={{ color: "var(--admin-muted)" }}>
-        Columnas: sku,name,price,special_price,url_img — separador coma o punto y coma, detectado automáticamente. Precios en formato argentino ("399.900", "$ 1.499.900").
+        Pegá los SKUs en el orden que querés mostrarlos (separados por espacio, coma o salto de línea). El resto de los datos (nombre, precio, categoría, imagen) se completa solo desde la base.
       </div>
       <textarea
         value={text}
         onChange={(e) => setText(e.target.value)}
-        placeholder="Pegá acá el CSV..."
+        placeholder={"X0031ARD21\nX0031ARD10\nT0061MAR2A\n..."}
         className="admin-input w-full h-32 p-2 text-[12px] font-mono mb-2"
+        disabled={disabled}
       />
       <div className="flex flex-wrap items-center gap-2">
-        <button onClick={handleImportClick} className="admin-btn px-3 py-1.5 text-[13px]">Importar CSV pegado</button>
-        <button onClick={() => fileRef.current && fileRef.current.click()} className="admin-btn-ghost px-3 py-1.5 text-[13px]">
-          Subir archivo .csv
+        <button onClick={handleGenerateClick} disabled={disabled} className="admin-btn px-3 py-1.5 text-[13px]">Generar grilla</button>
+        <button onClick={() => fileRef.current && fileRef.current.click()} disabled={disabled} className="admin-btn-ghost px-3 py-1.5 text-[13px]">
+          Subir archivo de SKUs
         </button>
-        <input ref={fileRef} type="file" accept=".csv,text/csv" className="hidden" onChange={handleFile} />
+        <input ref={fileRef} type="file" accept=".csv,.txt,text/csv,text/plain" className="hidden" onChange={handleFile} disabled={disabled} />
+        {disabled && <span className="text-[12px]" style={{ color: "var(--admin-danger)" }}>Cargá primero la base de productos.</span>}
       </div>
     </section>
   );
 }
 
-function ImportSummary({ summary, errors, onDismiss }) {
+function GenerateSummary({ summary, onDismiss }) {
   if (!summary) return null;
   return (
     <div className="p-3 mt-3 text-[12px]" style={{ background: "var(--admin-panel)", border: "1px solid var(--admin-border)" }}>
       <div className="flex items-center justify-between">
         <div>
-          <strong>{summary.total}</strong> filas procesadas
-          {errors.length > 0 && <span> · <strong style={{ color: "var(--admin-danger)" }}>{errors.length}</strong> con errores</span>}
+          <strong>{summary.found}</strong> de <strong>{summary.total}</strong> SKUs encontrados en la base
+          {summary.missing.length > 0 && <span> · <strong style={{ color: "var(--admin-danger)" }}>{summary.missing.length}</strong> no encontrados</span>}
+          {summary.duplicates.length > 0 && <span> · <strong>{summary.duplicates.length}</strong> repetidos (se ignoraron)</span>}
         </div>
         <button onClick={onDismiss} className="admin-btn-ghost px-2 py-1 text-[11px]">Cerrar</button>
       </div>
-      {errors.length > 0 && (
-        <ul className="mt-2 max-h-40 overflow-y-auto list-disc pl-5 space-y-0.5">
-          {errors.map((e, i) => (
-            <li key={i} style={{ color: "var(--admin-danger)" }}>{e}</li>
-          ))}
-        </ul>
+      {summary.missing.length > 0 && (
+        <div className="mt-2">
+          <div style={{ color: "var(--admin-danger)" }}>SKUs no encontrados en la base:</div>
+          <div className="mt-1 max-h-28 overflow-y-auto" style={{ color: "var(--admin-danger)" }}>{summary.missing.join(", ")}</div>
+        </div>
       )}
     </div>
   );
 }
 
-/* -------------------------------- Carga: tabla ------------------------------ */
+/* -------------------------------- Carga: preview ------------------------------ */
 
-function ProductsTable({ products, categories, onUpdate, onDelete, onDuplicate }) {
+function PreviewTable({ products, onRemove }) {
   return (
     <div className="mt-4" style={{ overflowX: "auto", border: "1px solid var(--admin-border)" }}>
-      <datalist id="categorias-list">
-        {categories.map((c) => <option key={c} value={c} />)}
-      </datalist>
-      <table className="w-full text-[12px] border-collapse" style={{ minWidth: 900 }}>
+      <table className="w-full text-[12px] border-collapse" style={{ minWidth: 800 }}>
         <thead>
           <tr style={{ background: "var(--admin-bg)" }}>
-            {["SKU", "Nombre", "Precio", "Precio promo", "Imagen (URL)", "Categoría", "Descuento", "Base artículo", ""].map((h) => (
+            {["SKU", "Nombre", "Categoría", "Precio", "Precio promo", "Imagen", ""].map((h) => (
               <th key={h} className="text-left px-2 py-2 font-medium" style={{ borderBottom: "1px solid var(--admin-border)", color: "var(--admin-muted)" }}>{h}</th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {products.map((p) => (
-            <ProductRow key={p.id} p={p} onUpdate={onUpdate} onDelete={onDelete} onDuplicate={onDuplicate} />
-          ))}
+          {products.map((p) => {
+            const imgOk = /^https?:\/\/\S+/i.test(p.url_img || "");
+            return (
+              <tr key={p.id} style={{ borderBottom: "1px solid var(--admin-border)" }}>
+                <td className="px-2 py-1 whitespace-nowrap">{p.sku}</td>
+                <td className="px-2 py-1">{p.name}</td>
+                <td className="px-2 py-1 whitespace-nowrap">{p.categoria}</td>
+                <td className="px-2 py-1 whitespace-nowrap tabular-nums">{formatPriceARS(p.price)}</td>
+                <td className="px-2 py-1 whitespace-nowrap tabular-nums">{p.special_price == null ? "—" : formatPriceARS(p.special_price)}</td>
+                <td className="px-2 py-1" style={!imgOk ? { color: "var(--admin-danger)" } : undefined}>{imgOk ? "OK" : "sin URL"}</td>
+                <td className="px-2 py-1">
+                  <button title="Quitar" onClick={() => onRemove(p.id)} className="admin-btn-ghost px-2 py-1" style={{ color: "var(--admin-danger)" }}>✕</button>
+                </td>
+              </tr>
+            );
+          })}
           {products.length === 0 && (
-            <tr><td colSpan={9} className="px-2 py-6 text-center" style={{ color: "var(--admin-muted)" }}>No hay productos cargados.</td></tr>
+            <tr><td colSpan={7} className="px-2 py-6 text-center" style={{ color: "var(--admin-muted)" }}>Todavía no generaste ninguna grilla.</td></tr>
           )}
         </tbody>
       </table>
@@ -626,161 +781,37 @@ function ProductsTable({ products, categories, onUpdate, onDelete, onDuplicate }
   );
 }
 
-function ProductRow({ p, onUpdate, onDelete, onDuplicate }) {
-  const descuento = getDescuento(p);
-  function field(key, value) {
-    onUpdate(p.id, { [key]: value });
-  }
-  function handleNameChange(value) {
-    const patch = { name: value };
-    if (!p.categoriaManual) {
-      patch.categoria = inferCategoria(value);
-    }
-    patch.baseArticle = getBaseArticle(value);
-    onUpdate(p.id, patch);
-  }
-  const imgOk = /^https?:\/\/\S+/i.test(p.url_img || "");
-  return (
-    <tr style={{ borderBottom: "1px solid var(--admin-border)" }}>
-      <td className="px-2 py-1">
-        <input className="admin-input px-1.5 py-1 w-28" value={p.sku} onChange={(e) => field("sku", e.target.value)} />
-      </td>
-      <td className="px-2 py-1">
-        <input className="admin-input px-1.5 py-1 w-56" value={p.name} onChange={(e) => handleNameChange(e.target.value)} />
-      </td>
-      <td className="px-2 py-1">
-        <input type="number" className="admin-input px-1.5 py-1 w-24" value={p.price} onChange={(e) => field("price", Number(e.target.value))} />
-      </td>
-      <td className="px-2 py-1">
-        <input
-          type="number"
-          className="admin-input px-1.5 py-1 w-24"
-          value={p.special_price == null ? "" : p.special_price}
-          placeholder="—"
-          onChange={(e) => field("special_price", e.target.value === "" ? null : Number(e.target.value))}
-        />
-      </td>
-      <td className="px-2 py-1">
-        <input
-          className="admin-input px-1.5 py-1 w-48"
-          style={!imgOk ? { color: "var(--admin-danger)" } : undefined}
-          value={p.url_img}
-          onChange={(e) => field("url_img", e.target.value)}
-          placeholder="sin URL"
-        />
-      </td>
-      <td className="px-2 py-1">
-        <input
-          list="categorias-list"
-          className="admin-input px-1.5 py-1 w-32"
-          value={p.categoria}
-          onChange={(e) => onUpdate(p.id, { categoria: e.target.value.toUpperCase(), categoriaManual: true })}
-        />
-      </td>
-      <td className="px-2 py-1 tabular-nums">{descuento > 0 ? Math.round(descuento * 100) + "%" : "—"}</td>
-      <td className="px-2 py-1" style={{ color: "var(--admin-muted)" }}>{p.baseArticle}</td>
-      <td className="px-2 py-1 whitespace-nowrap">
-        <button title="Duplicar" onClick={() => onDuplicate(p.id)} className="admin-btn-ghost px-2 py-1 mr-1">⧉</button>
-        <button title="Borrar" onClick={() => onDelete(p.id)} className="admin-btn-ghost px-2 py-1" style={{ color: "var(--admin-danger)" }}>✕</button>
-      </td>
-    </tr>
-  );
-}
-
 /* -------------------------------- Carga tab -------------------------------- */
 
-function CargaTab({ products, setProducts, categories }) {
-  const [summary, setSummary] = useState(null);
-  const [errors, setErrors] = useState([]);
+function CargaTab({ baseCatalog, onLoadBase, onGenerate, generateSummary, onDismissSummary, products, onRemoveSku, onClearAll }) {
   const [confirmClearAll, setConfirmClearAll] = useState(false);
-
-  function handleImport(text) {
-    const rows = parseCSV(text);
-    const existingSkus = new Set(products.map((p) => p.sku).filter(Boolean));
-    const batchSkus = new Set();
-    const newProducts = [];
-    const allErrors = [];
-    rows.forEach((r) => {
-      const rowErrors = [...r.rowErrors];
-      if (r.sku) {
-        if (existingSkus.has(r.sku) || batchSkus.has(r.sku)) {
-          rowErrors.push("SKU duplicado (" + r.sku + ")");
-        } else {
-          batchSkus.add(r.sku);
-        }
-      }
-      if (rowErrors.length) allErrors.push("Fila " + r.rowNumber + ": " + rowErrors.join("; "));
-      newProducts.push(makeProduct(r, false));
-    });
-    setProducts((prev) => [...prev, ...newProducts]);
-    setSummary({ total: rows.length });
-    setErrors(allErrors);
-  }
-
-  function updateProduct(id, patch) {
-    setProducts((prev) => prev.map((p) => (p.id === id ? { ...p, ...patch } : p)));
-  }
-  function deleteProduct(id) {
-    setProducts((prev) => prev.filter((p) => p.id !== id));
-  }
-  function duplicateProduct(id) {
-    setProducts((prev) => {
-      const idx = prev.findIndex((p) => p.id === id);
-      if (idx === -1) return prev;
-      const orig = prev[idx];
-      const copy = { ...orig, id: uid(), sku: orig.sku ? orig.sku + "-COPIA" : "", isExample: false };
-      const next = prev.slice();
-      next.splice(idx + 1, 0, copy);
-      return next;
-    });
-  }
-  function addBlankRow() {
-    setProducts((prev) => [...prev, makeProduct({ sku: "", name: "", price: 0, special_price: null, url_img: "" }, false)]);
-  }
-  function clearAll() {
-    setProducts([]);
-    setSummary(null);
-    setErrors([]);
-    setConfirmClearAll(false);
-  }
-  function clearExamples() {
-    setProducts((prev) => prev.filter((p) => !p.isExample));
-  }
-
-  const hasExamples = products.some((p) => p.isExample);
+  const hasBase = !!(baseCatalog && baseCatalog.rows.length);
 
   return (
     <div className="p-4 max-w-[1400px] mx-auto">
-      <CsvImportPanel onImport={handleImport} />
-      <ImportSummary summary={summary} errors={errors} onDismiss={() => { setSummary(null); setErrors([]); }} />
+      <BaseCatalogPanel baseCatalog={baseCatalog} onLoad={onLoadBase} />
+      <div className="mt-4">
+        <SkuListPanel disabled={!hasBase} onGenerate={onGenerate} />
+      </div>
+      <GenerateSummary summary={generateSummary} onDismiss={onDismissSummary} />
 
       <div className="flex flex-wrap items-center justify-between gap-2 mt-6 mb-2">
-        <div className="text-[14px] font-medium">Productos cargados ({products.length})</div>
-        <div className="flex gap-2">
-          {hasExamples && (
-            <button onClick={clearExamples} className="admin-btn-ghost px-3 py-1.5 text-[13px]">Limpiar ejemplos</button>
-          )}
-          <button onClick={addBlankRow} className="admin-btn-ghost px-3 py-1.5 text-[13px]">+ Agregar fila</button>
+        <div className="text-[14px] font-medium">Grilla generada ({products.length})</div>
+        {products.length > 0 && (
           <button onClick={() => setConfirmClearAll(true)} className="admin-btn-ghost px-3 py-1.5 text-[13px]" style={{ color: "var(--admin-danger)" }}>
-            Vaciar todo
+            Vaciar grilla
           </button>
-        </div>
+        )}
       </div>
 
-      <ProductsTable
-        products={products}
-        categories={categories}
-        onUpdate={updateProduct}
-        onDelete={deleteProduct}
-        onDuplicate={duplicateProduct}
-      />
+      <PreviewTable products={products} onRemove={onRemoveSku} />
 
       <ConfirmModal
         open={confirmClearAll}
-        title="¿Vaciar todos los productos?"
-        body="Esta acción borra toda la carga actual. No se puede deshacer."
-        confirmLabel="Vaciar todo"
-        onConfirm={clearAll}
+        title="¿Vaciar la grilla generada?"
+        body="Esto borra los SKUs cargados en esta grilla. La base de productos no se toca."
+        confirmLabel="Vaciar grilla"
+        onConfirm={() => { onClearAll(); setConfirmClearAll(false); }}
         onCancel={() => setConfirmClearAll(false)}
       />
     </div>
@@ -872,11 +903,11 @@ function StoreHeader({ categoryTitle, setCategoryTitle }) {
   );
 }
 
-function ProductImage({ url }) {
+function ProductImage({ url, href, talles }) {
   const [failed, setFailed] = useState(false);
   const showPlaceholder = !url || failed;
-  return (
-    <div style={{ width: "100%", aspectRatio: "3 / 4", background: "#e2e2e2", overflow: "hidden" }}>
+  const body = (
+    <div style={{ width: "100%", aspectRatio: "3 / 4", background: "#e2e2e2", overflow: "hidden", position: "relative" }}>
       {!showPlaceholder && (
         <img
           src={url}
@@ -885,8 +916,35 @@ function ProductImage({ url }) {
           style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
         />
       )}
+      {talles && talles.length > 0 && (
+        <div
+          style={{
+            position: "absolute",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(255,255,255,0.82)",
+            color: "#666666",
+            fontSize: 8.5,
+            letterSpacing: "0.05em",
+            textAlign: "center",
+            padding: "3px 4px",
+            textTransform: "uppercase",
+          }}
+        >
+          {talles.join("  ·  ")}
+        </div>
+      )}
     </div>
   );
+  if (href) {
+    return (
+      <a href={href} target="_blank" rel="noopener noreferrer" style={{ display: "block" }}>
+        {body}
+      </a>
+    );
+  }
+  return body;
 }
 
 function ProductCard({ product, colorCount, showLabels, isConflict, index, dnd }) {
@@ -910,7 +968,7 @@ function ProductCard({ product, colorCount, showLabels, isConflict, index, dnd }
       onDragEnd={dnd.onDragEnd}
     >
       <div style={{ position: "relative" }}>
-        <ProductImage url={product.url_img} />
+        <ProductImage url={product.url_img} href={product.productUrl} talles={product.talles} />
         {descuento > 0 && (
           <div style={{ position: "absolute", top: 0, left: 0, background: "#111111", color: "#fff", fontSize: 10, padding: "3px 6px" }}>
             -{Math.round(descuento * 100)}%
@@ -1118,16 +1176,26 @@ function GrillaTab({
 function App() {
   const [activeTab, setActiveTab] = useState("carga");
 
-  const [products, setProducts] = useState(() => {
-    if (PERSISTED && Array.isArray(PERSISTED.products)) return PERSISTED.products;
-    return seedExamples();
+  const [baseCatalog, setBaseCatalog] = useState(() => PERSISTED_BASE);
+  const catalogMap = useMemo(() => buildCatalogIndex(baseCatalog ? baseCatalog.rows : []), [baseCatalog]);
+
+  const [products, setProducts] = useState(() => (PERSISTED && Array.isArray(PERSISTED.products) ? PERSISTED.products : []));
+  const [order, setOrder] = useState(() => {
+    if (PERSISTED && Array.isArray(PERSISTED.order) && Array.isArray(PERSISTED.products)) {
+      const ids = new Set(PERSISTED.products.map((p) => p.id));
+      const validOrder = PERSISTED.order.filter((id) => ids.has(id));
+      if (validOrder.length === PERSISTED.products.length) return validOrder;
+      return PERSISTED.products.map((p) => p.id);
+    }
+    return [];
   });
-  const [order, setOrder] = useState(() => (PERSISTED && Array.isArray(PERSISTED.order) ? PERSISTED.order : []));
   const settings = (PERSISTED && PERSISTED.settings) || {};
   const [perRow, setPerRow] = useState(settings.perRow || 4);
   const [adjacencyEnabled, setAdjacencyEnabled] = useState(settings.adjacencyEnabled != null ? settings.adjacencyEnabled : true);
   const [showLabels, setShowLabels] = useState(settings.showLabels != null ? settings.showLabels : true);
   const [categoryTitle, setCategoryTitle] = useState(settings.categoryTitle || "REMERAS");
+
+  const [generateSummary, setGenerateSummary] = useState(null);
 
   const [toast, setToast] = useState("");
   const showToast = useCallback((msg) => setToast(msg), []);
@@ -1141,25 +1209,59 @@ function App() {
     return () => { cancelled = true; };
   }, []);
 
-  const lastKeyRef = useRef(null);
+  // Intento silencioso de auto-cargar base.csv si la app se sirve por http(s)
+  // (falla y no hace nada cuando se abre como archivo local, ahí hace falta subirlo a mano).
   useEffect(() => {
-    const key = JSON.stringify([products.map((p) => p.id), perRow, adjacencyEnabled]);
-    if (lastKeyRef.current === null) {
-      lastKeyRef.current = key;
-      const idsMatch = order.length === products.length && products.every((p) => order.includes(p.id));
-      if (idsMatch) return;
-    } else if (lastKeyRef.current === key) {
-      return;
-    } else {
-      lastKeyRef.current = key;
-    }
-    setOrder(buildOrder(products, perRow, adjacencyEnabled));
+    if (baseCatalog) return;
+    let cancelled = false;
+    fetch("./base.csv")
+      .then((r) => (r.ok ? r.text() : Promise.reject()))
+      .then((text) => {
+        if (cancelled) return;
+        const { rows } = parseBaseCsv(text);
+        if (rows.length) setBaseCatalog({ rows, updatedAt: Date.now(), sourceName: "base.csv (automático)" });
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [products, perRow, adjacencyEnabled]);
+  }, []);
 
   function recalcOrder() {
-    lastKeyRef.current = JSON.stringify([products.map((p) => p.id), perRow, adjacencyEnabled]);
     setOrder(buildOrder(products, perRow, adjacencyEnabled));
+  }
+
+  function handleLoadBase(text, sourceName) {
+    const { rows, errors } = parseBaseCsv(text);
+    if (!rows.length) {
+      showToast(errors[0] || "No se pudo leer la base");
+      return;
+    }
+    setBaseCatalog({ rows, updatedAt: Date.now(), sourceName });
+    showToast("Base cargada: " + rows.length + " SKUs" + (errors.length ? " (" + errors.length + " filas con errores)" : ""));
+  }
+
+  function handleGenerate(text) {
+    const tokens = parseSkuList(text);
+    if (!tokens.length) {
+      showToast("Pegá al menos un SKU");
+      return;
+    }
+    const result = generateFromSkuList(tokens, catalogMap);
+    setProducts(result.products);
+    setOrder(result.order);
+    setGenerateSummary({ total: tokens.length, found: result.products.length, missing: result.missing, duplicates: result.duplicates });
+    if (result.products.length) setActiveTab("grilla");
+  }
+
+  function removeSku(id) {
+    setProducts((prev) => prev.filter((p) => p.id !== id));
+    setOrder((prev) => prev.filter((oid) => oid !== id));
+  }
+
+  function clearGrid() {
+    setProducts([]);
+    setOrder([]);
+    setGenerateSummary(null);
   }
 
   useEffect(() => {
@@ -1170,17 +1272,24 @@ function App() {
     });
   }, [products, order, perRow, adjacencyEnabled, showLabels, categoryTitle]);
 
-  const categories = useMemo(() => {
-    const set = new Set(products.map((p) => p.categoria).filter(Boolean));
-    set.add("OTROS");
-    return Array.from(set).sort();
-  }, [products]);
+  useEffect(() => {
+    if (baseCatalog) savePersistedBase(baseCatalog);
+  }, [baseCatalog]);
 
   return (
     <div style={{ minHeight: "100vh" }}>
       <TabBar active={activeTab} onChange={setActiveTab} productCount={products.length} />
       {activeTab === "carga" ? (
-        <CargaTab products={products} setProducts={setProducts} categories={categories} />
+        <CargaTab
+          baseCatalog={baseCatalog}
+          onLoadBase={handleLoadBase}
+          onGenerate={handleGenerate}
+          generateSummary={generateSummary}
+          onDismissSummary={() => setGenerateSummary(null)}
+          products={products}
+          onRemoveSku={removeSku}
+          onClearAll={clearGrid}
+        />
       ) : (
         <GrillaTab
           products={products}
